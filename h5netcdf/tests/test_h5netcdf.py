@@ -1,10 +1,12 @@
 import gc
 import io
+import multiprocessing
 import random
 import re
 import string
 import sys
 import tempfile
+import traceback
 import urllib
 import urllib.request
 import weakref
@@ -3222,3 +3224,175 @@ def test_group_dimensions_classic(tmp_local_netcdf):
         with raises(CompatibilityError, match=r"Only one unlimited dimension allowed"):
             group.dimensions["z1"] = None
         assert list(group.dimensions) == ["y", "x", "z"]
+
+def _swmr_writer_process(
+    path, created, reader_ready, batch1_written, batch1_seen, batch2_written
+):
+    """Writer process: create the file, then append two batches in SWMR mode."""
+    try:
+        with h5netcdf.File(path, "w", libver="latest") as f:
+            f.dimensions["time"] = None
+            f.dimensions["x"] = 2
+            time = f.create_variable("time", ("time",), dtype=np.float64)
+            data = f.create_variable("data", ("time", "x"), dtype=np.float64)
+            partial = f.create_variable("partial", ("time",), dtype=np.float64)
+            # initial batch
+            f.resize_dimension("time", 2)
+            time[:] = [0.0, 1.0]
+            data[:] = [[0.0, 1.0], [2.0, 3.0]]
+            partial[:] = [10.0, 11.0]
+            f.flush()
+            f._h5file.flush()
+            f._h5file.swmr_mode = True
+            created.set()
+            # batch 1: grow to 4 records, leave "partial" unwritten in new range
+            reader_ready.wait(60)
+            f.resize_dimension("time", 4)
+            time[2:4] = [2.0, 3.0]
+            data[2:4] = [[4.0, 5.0], [6.0, 7.0]]
+            for var in (time, data, partial):
+                var._h5ds.flush()
+            f.dimensions["time"]._h5ds.flush()
+            batch1_written.set()
+            # batch 2: grow to 6 records, now "partial" is written completely
+            batch1_seen.wait(60)
+            f.resize_dimension("time", 6)
+            time[4:6] = [4.0, 5.0]
+            data[4:6] = [[8.0, 9.0], [10.0, 11.0]]
+            partial[2:6] = [12.0, 13.0, 14.0, 15.0]
+            for var in (time, data, partial):
+                var._h5ds.flush()
+            f.dimensions["time"]._h5ds.flush()
+            batch2_written.set()
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _swmr_reader_process(
+    path, created, reader_ready, batch1_written, batch1_seen, batch2_written, results
+):
+    """Reader process: watch the file grow via explicit refresh calls."""
+    try:
+        with h5netcdf.File(path, "r", swmr=True) as f:
+            data = f.variables["data"]
+            partial = f.variables["partial"]
+            results.put(("initial_shape", data.shape))
+            results.put(("initial_data", data[...].tolist()))
+            reader_ready.set()
+            # batch 1
+            batch1_written.wait(60)
+            results.put(("stale_shape", data.shape))
+            data.refresh()
+            partial.refresh()
+            results.put(("batch1_shape", data.shape))
+            results.put(("batch1_dimsize", f.dimensions["time"].size))
+            results.put(("batch1_data", data[...].tolist()))
+            results.put(("batch1_partial", partial[...].tolist()))
+            results.put(("same_object", data is f.variables["data"]))
+            batch1_seen.set()
+            # batch 2
+            batch2_written.wait(60)
+            data.refresh()
+            partial.refresh()
+            results.put(("batch2_shape", data.shape))
+            results.put(("batch2_data", data[...].tolist()))
+            results.put(("batch2_partial", partial[...].tolist()))
+    except Exception:
+        results.put(("error", traceback.format_exc()))
+        raise
+
+
+@requires_h5py
+@pytest.mark.timeout(180)
+def test_swmr_refresh_two_processes(tmp_path):
+    # a writer process appends batches in HDF5 SWMR mode while a reader
+    # process picks up the flushed ranges via Variable.refresh()
+    path = str(tmp_path / "swmr-append.nc")
+    ctx = multiprocessing.get_context("spawn")
+    created = ctx.Event()
+    reader_ready = ctx.Event()
+    batch1_written = ctx.Event()
+    batch1_seen = ctx.Event()
+    batch2_written = ctx.Event()
+    results = ctx.Queue()
+    writer = ctx.Process(
+        target=_swmr_writer_process,
+        args=(path, created, reader_ready, batch1_written, batch1_seen, batch2_written),
+    )
+    reader = ctx.Process(
+        target=_swmr_reader_process,
+        args=(
+            path,
+            created,
+            reader_ready,
+            batch1_written,
+            batch1_seen,
+            batch2_written,
+            results,
+        ),
+    )
+    writer.start()
+    assert created.wait(60), "writer process did not create the file"
+    reader.start()
+    reader.join(120)
+    writer.join(120)
+    assert reader.exitcode == 0, "reader process failed"
+    assert writer.exitcode == 0, "writer process failed"
+    collected = {}
+    while not results.empty():
+        key, value = results.get()
+        collected[key] = value
+    assert "error" not in collected, collected.get("error")
+    # before any refresh the reader only sees the initial range
+    assert collected["initial_shape"] == (2, 2)
+    assert collected["initial_data"] == [[0.0, 1.0], [2.0, 3.0]]
+    # the flushed batch 1 is not visible without an explicit refresh
+    assert collected["stale_shape"] == (2, 2)
+    # after refresh the same Variable objects expose the new range
+    assert collected["same_object"] is True
+    assert collected["batch1_shape"] == (4, 2)
+    assert collected["batch1_dimsize"] == 4
+    assert collected["batch1_data"] == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]
+    # "partial" was grown but not written in batch 1: normal fill semantics
+    assert collected["batch1_partial"] == [10.0, 11.0, 0.0, 0.0]
+    # batch 2 becomes visible after another refresh
+    assert collected["batch2_shape"] == (6, 2)
+    assert collected["batch2_data"] == [
+        [0.0, 1.0],
+        [2.0, 3.0],
+        [4.0, 5.0],
+        [6.0, 7.0],
+        [8.0, 9.0],
+        [10.0, 11.0],
+    ]
+    assert collected["batch2_partial"] == [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+
+
+@requires_h5py
+def test_refresh_non_swmr_file(tmp_local_netcdf):
+    # refresh on a plain (non-SWMR) file is a harmless no-op
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 3
+        v = f.create_variable("v", ("x",), dtype=np.float64)
+        v[:] = [1.0, 2.0, 3.0]
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        v = f.variables["v"]
+        v.refresh()
+        assert v.shape == (3,)
+        np.testing.assert_array_equal(v[...], [1.0, 2.0, 3.0])
+
+
+@requires_pyfive
+def test_refresh_unsupported_backend(tmp_local_netcdf, monkeypatch):
+    monkeypatch.setenv("PYFIVE_UNSUPPORTED_FEATURE", "warn")
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 3
+        v = f.create_variable("v", ("x",), dtype=np.float64)
+        v[:] = [1.0, 2.0, 3.0]
+    with h5netcdf.File(tmp_local_netcdf, "r", backend="pyfive") as f:
+        v = f.variables["v"]
+        with raises(
+            NotImplementedError, match="only supported with the 'h5py' backend"
+        ):
+            v.refresh()

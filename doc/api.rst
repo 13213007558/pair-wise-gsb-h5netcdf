@@ -18,6 +18,7 @@ This page provides an auto-generated summary of h5netcdf's new API.
    Group
    Dimension
    Variable
+   Variable.refresh
    CompoundType
    EnumType
    VLType

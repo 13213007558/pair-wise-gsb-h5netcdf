@@ -589,6 +589,53 @@ class BaseVariable(BaseObject):
     def __len__(self):
         return self.shape[0]
 
+    def refresh(self):
+        """Refresh the variable and its dimension scales from the file.
+
+        This is mainly useful when reading a file that is concurrently
+        being appended to by another process in HDF5 SWMR mode. It reloads
+        the metadata of the variable's underlying HDF5 dataset and of the
+        HDF5 dimension scales it depends on, and drops h5netcdf's cached
+        dimension information so that ``shape`` and ``dimensions`` reflect
+        the refreshed state. The same ``Variable`` object stays usable.
+
+        Only data and metadata the writer has already flushed is
+        guaranteed to become visible; nothing is promised about data the
+        writer has not (yet) flushed. Regions the writer has grown but not
+        yet written read back with the normal fill semantics. Refreshing
+        several variables is not an atomic transaction: each variable (and
+        its dimension scales) is refreshed individually, so variables may
+        briefly reflect different generations of the file.
+
+        Objects created after SWMR mode was established (new variables,
+        groups or dimensions) are not supported by the underlying HDF5
+        SWMR mechanism and are not made visible by this method; only
+        datasets that already existed when the file was opened can be
+        refreshed.
+
+        This requires the ``h5py`` backend. On files that are not opened
+        in SWMR mode refreshing is a harmless no-op.
+
+        Raises
+        ------
+        NotImplementedError
+            If the file is not opened with the ``h5py`` backend.
+        """
+        if self._backend != "h5py":
+            raise NotImplementedError(
+                "refresh() is only supported with the 'h5py' backend, "
+                f"not with backend {self._backend!r}."
+            )
+        # refresh the variable's own dataset
+        self._h5ds.refresh()
+        # refresh the dimension scales this variable depends on
+        for dim in self.dimensions:
+            dimension = self._parent._all_dimensions[dim]
+            if not dimension._phony:
+                dimension._h5ds.refresh()
+        # drop cached dimension information so it is re-resolved
+        self._dimensions = None
+
     @property
     def _h5type_identifier(self):
         """Returns type identifier.
