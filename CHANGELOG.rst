@@ -3,6 +3,10 @@ Change Log
 
 Development Version (unreleased):
 
+- Add ``Variable.refresh()`` for the ``h5py`` backend, refreshing a variable
+  and its dimension scales when reading files which are concurrently appended
+  to in HDF5 SWMR mode.
+
 - Fix CI issues with xarray nightly tests (add pytz dependency) and h5pyd tests (pin setuptools=81) (:issue:`312`, :pull:`313`) by `Kai Mühlbauer <https://github.com/kmuehlbauer>`_
 - FIX CI wrt setup-micromamba v3, update ros3 tests to work with HDF v2 (:pull:`316`) by `Kai Mühlbauer <https://github.com/kmuehlbauer>`_
 - Use netcdf4 instead of netCDF4 for conda-based installations (:pull:`318`) by `Kai Mühlbauer <https://github.com/kmuehlbauer>`_

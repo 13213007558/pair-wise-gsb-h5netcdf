@@ -3222,3 +3222,127 @@ def test_group_dimensions_classic(tmp_local_netcdf):
         with raises(CompatibilityError, match=r"Only one unlimited dimension allowed"):
             group.dimensions["z1"] = None
         assert list(group.dimensions) == ["y", "x", "z"]
+
+
+def _swmr_append_writer(path, ready, opened, batch1_written, batch2_written, go1, go2):
+    """Writer process: create file, then append two batches in SWMR mode."""
+    with h5netcdf.File(path, "w", libver="latest") as f:
+        f.dimensions["time"] = None
+        data = f.create_variable("data", ("time",), dtype=np.int64)
+        partial = f.create_variable(
+            "partial", ("time",), dtype=np.float64, fillvalue=-1.0
+        )
+        f._h5file.swmr_mode = True
+        ready.set()
+        # wait until the reader has opened the file
+        assert opened.wait(timeout=60)
+
+        # batch 1: append 4 records, only partially write `partial`
+        f.resize_dimension("time", 4)
+        data[:] = np.arange(4)
+        partial[:2] = np.arange(2, dtype=np.float64)
+        f._h5file.flush()
+        batch1_written.set()
+        assert go1.wait(timeout=60)
+
+        # batch 2: append 4 more records, again only partially write `partial`
+        f.resize_dimension("time", 8)
+        data[4:] = np.arange(4, 8)
+        partial[4:6] = np.arange(4, 6, dtype=np.float64)
+        f._h5file.flush()
+        batch2_written.set()
+        assert go2.wait(timeout=60)
+
+
+@requires_h5py
+def test_swmr_refresh_two_processes(tmp_path):
+    # reader sees batches appended by a separate writer process after refresh()
+    import multiprocessing as mp
+
+    path = str(tmp_path / "swmr_append.nc")
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    opened = ctx.Event()
+    batch1_written = ctx.Event()
+    batch2_written = ctx.Event()
+    go1 = ctx.Event()
+    go2 = ctx.Event()
+    writer = ctx.Process(
+        target=_swmr_append_writer,
+        args=(path, ready, opened, batch1_written, batch2_written, go1, go2),
+    )
+    writer.start()
+    try:
+        assert ready.wait(timeout=60)
+        with h5netcdf.File(path, "r", swmr=True) as f:
+            data = f.variables["data"]
+            partial = f.variables["partial"]
+            # nothing has been appended yet
+            assert data.shape == (0,)
+            assert f.dimensions["time"].size == 0
+            opened.set()
+
+            # first batch was flushed by the writer
+            assert batch1_written.wait(timeout=60)
+            data.refresh()
+            partial.refresh()
+            # the same Variable objects now see the new range
+            assert f.variables["data"] is data
+            assert data.shape == (4,)
+            assert f.dimensions["time"].size == 4
+            np.testing.assert_array_equal(data[:], np.arange(4))
+            # not-yet-written parts of the associated variable read as fill
+            np.testing.assert_array_equal(partial[:2], np.arange(2, dtype=np.float64))
+            np.testing.assert_array_equal(partial[2:4], np.full(2, -1.0))
+            go1.set()
+
+            # second batch was flushed by the writer
+            assert batch2_written.wait(timeout=60)
+            data.refresh()
+            partial.refresh()
+            assert data.shape == (8,)
+            assert f.dimensions["time"].size == 8
+            np.testing.assert_array_equal(data[:], np.arange(8))
+            np.testing.assert_array_equal(
+                partial[4:6], np.arange(4, 6, dtype=np.float64)
+            )
+            np.testing.assert_array_equal(partial[2:4], np.full(2, -1.0))
+            np.testing.assert_array_equal(partial[6:8], np.full(2, -1.0))
+            go2.set()
+    finally:
+        go1.set()
+        go2.set()
+        writer.join(timeout=60)
+        if writer.is_alive():
+            writer.terminate()
+            writer.join()
+    assert writer.exitcode == 0
+
+
+@requires_h5py
+def test_refresh_non_swmr_file(tmp_local_netcdf):
+    # refresh on a regular (non-SWMR) file is a no-op
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 3
+        var = f.create_variable("v", ("x",), dtype=np.int64, data=np.arange(3))
+        var.refresh()
+        np.testing.assert_array_equal(var[:], np.arange(3))
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        var = f.variables["v"]
+        var.refresh()
+        assert var.shape == (3,)
+        np.testing.assert_array_equal(var[:], np.arange(3))
+
+
+@requires_pyfive
+def test_refresh_unsupported_backend(tmp_local_netcdf):
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 3
+        f.create_variable("v", ("x",), dtype=np.int64, data=np.arange(3))
+
+    with h5netcdf.File(tmp_local_netcdf, "r", backend="pyfive") as f:
+        with raises(
+            NotImplementedError, match="only supported with the 'h5py' backend"
+        ):
+            f.variables["v"].refresh()

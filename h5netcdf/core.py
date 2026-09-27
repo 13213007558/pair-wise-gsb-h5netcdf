@@ -575,6 +575,51 @@ class BaseVariable(BaseObject):
             self._dimensions = self._lookup_dimensions()
         return self._dimensions
 
+    def refresh(self):
+        """Refresh variable metadata and data from the file.
+
+        This is only supported with the ``h5py`` backend. It is mainly
+        useful when reading a file which is concurrently appended to by a
+        writer in HDF5 SWMR (single-writer/multiple-reader) mode.
+
+        The variable's dataset as well as the dimension scales of all its
+        dimensions are refreshed and h5netcdf's cached shape and dimension
+        information is updated. Existing ``Variable`` objects stay usable
+        and reflect the new ranges without closing and reopening the file.
+
+        Notes
+        -----
+        Only data the writer has already flushed is guaranteed to become
+        visible; no visibility is promised for not-yet-flushed data.
+
+        Refreshing several variables is not an atomic transaction: each
+        variable and its dimension scales are refreshed independently, so
+        after refreshing multiple variables their visible ranges may
+        correspond to different points in the writer's history.
+
+        HDF5 SWMR does not support objects created after SWMR mode was
+        established. Variables, dimensions, groups or attributes created
+        by the writer after this file was opened cannot be discovered by
+        ``refresh``; the file needs to be closed and reopened to see them.
+
+        On files which are not accessed in SWMR mode this is a no-op.
+        """
+        if self._backend != "h5py":
+            raise NotImplementedError(
+                "refresh() is only supported with the 'h5py' backend, "
+                f"got backend {self._backend!r}."
+            )
+        # refresh the dimension scales of all dimensions
+        for dim in self.dimensions:
+            dimension = self._parent._all_dimensions[dim]
+            if not dimension._phony:
+                dimension._h5ds.refresh()
+        # refresh the dataset itself
+        self._h5ds.refresh()
+        # reset cached dimension information,
+        # it is re-looked-up from the file on next access
+        self._dimensions = None
+
     @property
     def shape(self):
         """Return current sizes of all variable dimensions."""
