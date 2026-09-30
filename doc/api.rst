@@ -15,6 +15,7 @@ This page provides an auto-generated summary of h5netcdf's new API.
    File.create_group
    File.create_variable
    File.resize_dimension
+   File.rename_dimension
    Group
    Dimension
    Variable

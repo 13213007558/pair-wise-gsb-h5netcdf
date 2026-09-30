@@ -1177,6 +1177,278 @@ def test_creating_and_resizing_unlimited_dimensions(
         assert f["z"].maxshape == (None,)
 
 
+@requires_h5py
+@requires_netCDF4
+def test_rename_dimension_persists_bindings(tmp_local_netcdf):
+    import netCDF4
+
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        f.create_variable("x", ("x",), np.int32, data=np.array([1, 2]))
+        f.dimensions["time"] = None
+        f.resize_dimension("time", 3)
+        f.create_variable(
+            "time", ("time",), np.int32, data=np.array([10, 11, 12])
+        )
+        values = np.arange(6, dtype=np.int32).reshape(2, 3)
+        values[0, :] += 20
+        values[1, :] += 30
+        data = f.create_variable("data", ("x", "time"), np.int32, data=values)
+
+        f.rename_dimension("x", "lon")
+        f.rename_dimension("time", "t", rename_coord_variable=True)
+
+        assert "lon" in f.dimensions
+        assert "x" not in f.dimensions
+        assert "x" in f.variables
+        assert "t" in f.dimensions
+        assert "t" in f.variables
+        assert data.dimensions == ("lon", "t")
+        assert f.variables["x"].dimensions == ("lon",)
+        assert f.variables["t"].dimensions == ("t",)
+        assert f.dimensions["lon"]._dimid == 0
+        assert f.dimensions["t"]._dimid == 1
+        assert f.dimensions["t"].isunlimited()
+        assert f.variables["t"]._h5ds.maxshape == (None,)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert set(f.dimensions) == {"lon", "t"}
+        assert set(f.variables) == {"x", "t", "data"}
+        assert f.variables["data"].dimensions == ("lon", "t")
+        assert f.variables["x"].dimensions == ("lon",)
+        assert f.variables["t"].dimensions == ("t",)
+        np.testing.assert_array_equal(f.variables["x"][:], [1, 2])
+        np.testing.assert_array_equal(f.variables["t"][:], [10, 11, 12])
+        np.testing.assert_array_equal(f.variables["data"][:], values)
+        assert f.dimensions["lon"]._dimid == 0
+        assert f.dimensions["t"]._dimid == 1
+        assert f.dimensions["t"].isunlimited()
+        assert f.variables["t"]._h5ds.maxshape == (None,)
+
+    with netCDF4.Dataset(tmp_local_netcdf, "r") as ds:
+        assert set(ds.dimensions) == {"lon", "t"}
+        assert set(ds.variables) == {"x", "t", "data"}
+        assert ds.variables["data"].dimensions == ("lon", "t")
+        assert ds.variables["x"].dimensions == ("lon",)
+        assert ds.variables["t"].dimensions == ("t",)
+        np.testing.assert_array_equal(ds.variables["x"][:], [1, 2])
+        np.testing.assert_array_equal(ds.variables["t"][:], [10, 11, 12])
+        np.testing.assert_array_equal(ds.variables["data"][:], values)
+        assert ds.dimensions["lon"]._dimid == 0
+        assert ds.dimensions["t"]._dimid == 1
+        assert ds.dimensions["t"].isunlimited()
+
+
+@requires_h5py
+@requires_netCDF4
+def test_rename_dimension_without_coordinate_variable(tmp_local_netcdf):
+    import netCDF4
+
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        data = f.create_variable("data", ("x",), np.int32, data=np.array([7, 8]))
+        f.rename_dimension("x", "y")
+        assert data.dimensions == ("y",)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        assert list(f.dimensions) == ["y"]
+        assert list(f.variables) == ["data"]
+        assert f.variables["data"].dimensions == ("y",)
+        np.testing.assert_array_equal(f.variables["data"][:], [7, 8])
+        assert f.dimensions["y"]._dimid == 0
+
+    with netCDF4.Dataset(tmp_local_netcdf, "r") as ds:
+        assert list(ds.dimensions) == ["y"]
+        assert list(ds.variables) == ["data"]
+        assert ds.variables["data"].dimensions == ("y",)
+        np.testing.assert_array_equal(ds.variables["data"][:], [7, 8])
+        assert ds.dimensions["y"]._dimid == 0
+
+
+@requires_h5py
+@requires_netCDF4
+def test_rename_dimension_in_child_group(tmp_local_netcdf):
+    import netCDF4
+
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        group = f.create_group("child")
+        group.dimensions["x"] = 2
+        group.create_variable(
+            "x", ("x",), np.int32, data=np.array([1, 2])
+        )
+        group.rename_dimension("x", "y")
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        group = f.groups["child"]
+        assert list(f.dimensions) == []
+        assert list(group.dimensions) == ["y"]
+        assert group.variables["x"].dimensions == ("y",)
+
+    with netCDF4.Dataset(tmp_local_netcdf, "r") as ds:
+        group = ds.groups["child"]
+        assert list(ds.dimensions) == []
+        assert list(group.dimensions) == ["y"]
+        assert group.variables["x"].dimensions == ("y",)
+
+
+@requires_h5py
+@requires_netCDF4
+def test_rename_dimension_with_parent_child_shadowing(tmp_local_netcdf):
+    import netCDF4
+
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        f.create_variable("x", ("x",), np.int32, data=np.array([0, 1]))
+        root_var = f.create_variable(
+            "root_var", ("x",), np.int32, data=np.array([1, 2])
+        )
+        group = f.create_group("child")
+        group.dimensions["x"] = 2
+        local_var = group.create_variable(
+            "local_var", ("x",), np.int32, data=np.array([3, 4])
+        )
+        inherited_var = group.create_variable(
+            "inherited_var", ("x",), np.int32, data=np.array([5, 6])
+        )
+        nested_group = group.create_group("nested")
+        nested_var = nested_group.create_variable(
+            "nested_var", ("x",), np.int32, data=np.array([7, 8])
+        )
+
+        parent_scale = f._h5group["x"]
+        local_scale = group._h5group["x"]
+        target = group._h5group["inherited_var"]
+        target.dims[0].detach_scale(local_scale)
+        target.dims[0].attach_scale(parent_scale)
+        target.attrs["_Netcdf4Coordinates"] = np.array(
+            [parent_scale.attrs["_Netcdf4Dimid"]], dtype=np.int32
+        )
+        nested_target = nested_group._h5group["nested_var"]
+        nested_target.dims[0].detach_scale(local_scale)
+        nested_target.dims[0].attach_scale(parent_scale)
+        nested_target.attrs["_Netcdf4Coordinates"] = np.array(
+            [parent_scale.attrs["_Netcdf4Dimid"]], dtype=np.int32
+        )
+
+        f.rename_dimension("x", "parent_x")
+
+        assert root_var.dimensions == ("parent_x",)
+        assert local_var.dimensions == ("x",)
+        assert inherited_var.dimensions == ("parent_x",)
+        assert nested_var.dimensions == ("parent_x",)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        group = f.groups["child"]
+        assert "parent_x" in f.dimensions
+        assert "x" not in f.dimensions
+        assert set(group.dimensions) == {"x"}
+        assert f.variables["root_var"].dimensions == ("parent_x",)
+        assert group.variables["local_var"].dimensions == ("x",)
+        assert group.variables["inherited_var"].dimensions == ("parent_x",)
+        assert (
+            group.groups["nested"].variables["nested_var"].dimensions
+            == ("parent_x",)
+        )
+        np.testing.assert_array_equal(group.variables["local_var"][:], [3, 4])
+        np.testing.assert_array_equal(group.variables["inherited_var"][:], [5, 6])
+        np.testing.assert_array_equal(
+            group.groups["nested"].variables["nested_var"][:], [7, 8]
+        )
+
+    with netCDF4.Dataset(tmp_local_netcdf, "r") as ds:
+        group = ds.groups["child"]
+        assert "parent_x" in ds.dimensions
+        assert "x" not in ds.dimensions
+        assert set(group.dimensions) == {"x"}
+        assert ds.variables["root_var"].dimensions == ("parent_x",)
+        assert group.variables["local_var"].dimensions == ("x",)
+        assert group.variables["inherited_var"].dimensions == ("parent_x",)
+        assert (
+            group.groups["nested"].variables["nested_var"].dimensions
+            == ("parent_x",)
+        )
+        np.testing.assert_array_equal(group.variables["local_var"][:], [3, 4])
+        np.testing.assert_array_equal(group.variables["inherited_var"][:], [5, 6])
+        np.testing.assert_array_equal(
+            group.groups["nested"].variables["nested_var"][:], [7, 8]
+        )
+
+
+@requires_h5py
+def test_rename_dimension_reports_conflicts_before_modification(
+    tmp_local_netcdf,
+):
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        f.dimensions["existing_dim"] = 3
+        f.create_variable("existing_var", ("x",), np.int32, data=[1, 2])
+        f.create_group("existing_group")
+
+        for new_name in ("existing_dim", "existing_var", "existing_group"):
+            with raises(ValueError, match=f"{new_name!r} already exists"):
+                f.rename_dimension("x", new_name)
+
+        assert list(f.dimensions) == ["x", "existing_dim"]
+        assert f.variables["existing_var"].dimensions == ("x",)
+        assert list(f.groups) == ["existing_group"]
+
+
+@requires_h5py
+def test_rename_dimension_reports_child_shadow_conflict(tmp_local_netcdf):
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        f.create_variable("x", ("x",), np.int32, data=[1, 2])
+        group = f.create_group("child")
+        group.dimensions["y"] = 2
+        local_var = group.create_variable(
+            "local_var", ("y",), np.int32, data=[3, 4]
+        )
+        group.create_variable(
+            "inherited_var", ("y",), np.int32, data=[5, 6]
+        )
+
+        parent_scale = f._h5group["x"]
+        local_scale = group._h5group["y"]
+        target = group._h5group["inherited_var"]
+        target.dims[0].detach_scale(local_scale)
+        target.dims[0].attach_scale(parent_scale)
+        target.attrs["_Netcdf4Coordinates"] = np.array(
+            [parent_scale.attrs["_Netcdf4Dimid"]], dtype=np.int32
+        )
+
+        with raises(ValueError, match="would shadow a child-group dimension"):
+            f.rename_dimension("x", "y")
+
+        assert list(f.dimensions) == ["x"]
+        assert local_var.dimensions == ("y",)
+        assert [scale.name for scale in target.dims[0].values()] == ["/x"]
+
+
+@requires_h5py
+def test_rename_dimension_allows_unrelated_child_shadow_dimension(
+    tmp_local_netcdf,
+):
+    with h5netcdf.File(tmp_local_netcdf, "w") as f:
+        f.dimensions["x"] = 2
+        f.create_variable("x", ("x",), np.int32, data=[1, 2])
+        f.create_variable("root_data", ("x",), np.int32, data=[3, 4])
+        group = f.create_group("child")
+        group.dimensions["y"] = 2
+        group.create_variable("child_data", ("y",), np.int32, data=[5, 6])
+
+        f.rename_dimension("x", "y")
+
+        assert f.variables["root_data"].dimensions == ("y",)
+        assert group.variables["child_data"].dimensions == ("y",)
+
+    with h5netcdf.File(tmp_local_netcdf, "r") as f:
+        group = f.groups["child"]
+        assert "y" in f.dimensions
+        assert "y" in group.dimensions
+        assert f.variables["root_data"].dimensions == ("y",)
+        assert group.variables["child_data"].dimensions == ("y",)
+
+
 def test_creating_variables_with_unlimited_dimensions(
     write_backend, read_backend, tmp_backend_netcdf
 ):

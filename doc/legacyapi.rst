@@ -14,6 +14,7 @@ This page provides an auto-generated summary of h5netcdf's legacy API.
    Dataset
    Dataset.createGroup
    Dataset.createDimension
+   Dataset.renameDimension
    Dataset.createVariable
    Group
    Dimension

@@ -141,6 +141,7 @@ class Group(core.Group, HasAttributesMixin):
     createEnumType = core.Group.create_enumtype
     createVLType = core.Group.create_vltype
     createCompoundType = core.Group.create_cmptype
+    renameDimension = core.Group.rename_dimension
 
     def createDimension(self, name, size):
         """Creates a new dimension with given name and size.

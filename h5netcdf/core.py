@@ -1,6 +1,7 @@
 # For details on how netCDF4 builds on HDF5:
 # https://docs.unidata.ucar.edu/netcdf-c/current/file_format_specifications.html#netcdf_4_spec
 import os
+import uuid
 import warnings
 import weakref
 from collections import ChainMap, Counter, OrderedDict, defaultdict
@@ -575,6 +576,9 @@ class BaseVariable(BaseObject):
             self._dimensions = self._lookup_dimensions()
         return self._dimensions
 
+    def _reset_dimension_cache(self):
+        self._dimensions = None
+
     @property
     def shape(self):
         """Return current sizes of all variable dimensions."""
@@ -902,7 +906,10 @@ class _LazyObjectLookup(Mapping):
 
 
 def _netcdf_dimension_but_not_variable(h5py_dataset):
-    return NOT_A_VARIABLE in h5py_dataset.attrs.get("NAME", b"")
+    name = h5py_dataset.attrs.get("NAME", b"")
+    if isinstance(name, str):
+        name = name.encode("utf-8")
+    return NOT_A_VARIABLE in name
 
 
 def _unlabeled_dimension_mix(h5py_dataset):
@@ -1688,6 +1695,251 @@ class Group(Mapping):
         zero) where necessary.
         """
         self._dimensions[dim]._resize(size)
+
+    def rename_dimension(self, old_name, new_name, rename_coord_variable=False):
+        """Rename a dimension and its HDF5 dimension scale.
+
+        Parameters
+        ----------
+        old_name : str
+            Name of the existing dimension.
+        new_name : str
+            New dimension name.
+        rename_coord_variable : bool, optional
+            If True and a coordinate variable with the old name exists, rename
+            that variable as well. If False (the default), the coordinate
+            variable keeps its name and a separate dimension scale is created.
+        """
+        if not self._root._writable:
+            raise RuntimeError("H5NetCDF: Write to read only")
+        if old_name == new_name:
+            raise ValueError("new dimension name must be different from old name")
+
+        try:
+            dimension = self._dimensions[old_name]
+        except KeyError:
+            raise ValueError(f"dimension {old_name!r} does not exist") from None
+
+        if dimension._phony:
+            raise ValueError("phony dimensions cannot be renamed")
+
+        conflicts = self._dimension_rename_conflicts(old_name, new_name)
+        if conflicts:
+            raise ValueError("cannot rename dimension: " + "; ".join(conflicts))
+        if self._root._backend == "pyfive":
+            raise ValueError("renaming dimensions is not supported by pyfive")
+
+        scale = dimension._h5ds
+        dimid = dimension._dimid
+        refs = dimension._scale_refs
+        coord_variable = self._rename_coord_variable(old_name)
+        temporary_name = f"__rename_dimension_{uuid.uuid4().hex}__"
+
+        def reset_referenced_variable_caches():
+            for ref, _ in refs:
+                variable = self._variable_for_h5path(self._root._h5file[ref].name)
+                if variable is not None:
+                    variable._reset_dimension_cache()
+
+        if coord_variable is not None and rename_coord_variable:
+            self._h5group.move(old_name, new_name)
+            scale.attrs["NAME"] = np.bytes_(new_name, "utf-8")
+
+            objects = self._variables._objects
+            objects[new_name] = objects.pop(old_name)
+            coord_variable._h5path = _join_h5paths(self.name, new_name)
+            coord_variable._reset_dimension_cache()
+            reset_referenced_variable_caches()
+        else:
+            new_scale = None
+            if coord_variable is not None:
+                for ref, axis in refs:
+                    referenced = self._root._h5file[ref]
+                    referenced.dims[axis].detach_scale(scale)
+                temporary_kwargs = {}
+                if scale.maxshape[0] is None:
+                    temporary_kwargs["maxshape"] = scale.maxshape
+                if "_FillValue" in scale.attrs:
+                    temporary_kwargs["fillvalue"] = scale.fillvalue
+                if self._root._h5py.__name__ == "h5py":
+                    temporary_kwargs["track_order"] = self._track_order
+                copied_coord = self._h5group.create_dataset(
+                    temporary_name,
+                    scale.shape,
+                    dtype=scale.dtype,
+                    data=scale[...],
+                    chunks=scale.chunks,
+                    compression=scale.compression,
+                    compression_opts=scale.compression_opts,
+                    shuffle=scale.shuffle,
+                    fletcher32=scale.fletcher32,
+                    **temporary_kwargs,
+                )
+                for attr_name, value in scale.attrs.items():
+                    if attr_name not in {
+                        "CLASS",
+                        "NAME",
+                        "DIMENSION_LIST",
+                        "REFERENCE_LIST",
+                        "_Netcdf4Dimid",
+                    }:
+                        copied_coord.attrs[attr_name] = value
+                for axis, coord_id in enumerate(
+                    scale.attrs.get("_Netcdf4Coordinates", [])
+                ):
+                    if coord_id != dimid:
+                        other_dimension = self._dimension_for_id(coord_id)
+                        if other_dimension is not None:
+                            copied_coord.dims[axis].attach_scale(
+                                other_dimension._h5ds
+                            )
+                for attr_name in (
+                    "CLASS",
+                    "NAME",
+                    "DIMENSION_LIST",
+                    "REFERENCE_LIST",
+                    "_Netcdf4Dimid",
+                ):
+                    if attr_name in copied_coord.attrs:
+                        del copied_coord.attrs[attr_name]
+
+                new_scale = self._create_dimension_rename_scale(
+                    dimension, new_name, dimid
+                )
+                referenced_variables = [copied_coord]
+                referenced_variables.extend(
+                    self._root._h5file[ref] for ref, _ in refs
+                )
+                for referenced in referenced_variables:
+                    coord_ids = referenced.attrs.get("_Netcdf4Coordinates", [])
+                    for axis, attached_dimid in enumerate(coord_ids):
+                        if attached_dimid == dimid:
+                            referenced.dims[axis].attach_scale(new_scale)
+
+                del self._h5group[old_name]
+                self._h5group.move(temporary_name, old_name)
+                coord_variable._reset_dimension_cache()
+                reset_referenced_variable_caches()
+            else:
+                self._h5group.move(old_name, new_name)
+                dimension._h5path = _join_h5paths(self.name, new_name)
+                dimension._h5ds.attrs["NAME"] = np.bytes_(
+                    NOT_A_VARIABLE + bytes(f"{dimension.size:10}", "ascii")
+                )
+                reset_referenced_variable_caches()
+
+        dimension._name = new_name
+        dimension._h5path = _join_h5paths(self.name, new_name)
+        objects = self._dimensions._objects
+        objects[new_name] = objects.pop(old_name)
+
+    def _create_dimension_rename_scale(self, dimension, name, dimid):
+        kwargs = {}
+        if dimension.isunlimited():
+            kwargs["maxshape"] = (None,)
+        if self._root._h5py.__name__ == "h5py":
+            kwargs["track_order"] = self._track_order
+
+        scale = self._h5group.create_dataset(
+            name,
+            (dimension.size,),
+            dtype=">f4",
+            **kwargs,
+        )
+        dimlen = bytes(f"{dimension.size:10}", "ascii")
+        scale.make_scale(np.bytes_(NOT_A_VARIABLE + dimlen))
+        scale.attrs["_Netcdf4Dimid"] = np.array(dimid, dtype=np.int32)
+        return scale
+
+    def _dimension_for_id(self, dimid):
+        for group in self._root._iter_groups():
+            for dimension in group._dimensions.values():
+                if not dimension._phony and dimension._dimid == dimid:
+                    return dimension
+        return None
+
+    def _rename_coord_variable(self, name):
+        if name not in self._variables._objects or name not in self._h5group:
+            return None
+
+        scale = self._h5group[name]
+        if self._root._h5py.h5ds.is_scale(scale.id):
+            return self._variables[name]
+        return None
+
+    def _dimension_rename_conflicts(self, old_name, new_name):
+        conflicts = []
+        if new_name in self._dimensions:
+            conflicts.append(f"dimension {new_name!r} already exists")
+
+        groups = []
+        parent = self._parent
+        while parent is not None and parent is not parent._root:
+            groups.append(parent)
+            parent = parent._parent
+        if self is not self._root:
+            groups.append(self._root)
+        for group in reversed(groups):
+            if new_name in group._dimensions:
+                conflicts.append(
+                    f"dimension {new_name!r} would shadow an existing parent dimension"
+                )
+
+        for ref, _ in self._dimensions[old_name]._scale_refs:
+            variable_group = self._group_for_h5path(
+                self._root._h5file[ref].name.rsplit("/", 1)[0] or "/"
+            )
+            groups = []
+            while variable_group is not self:
+                groups.append(variable_group)
+                variable_group = variable_group._parent
+            for variable_group in reversed(groups):
+                if new_name in variable_group._dimensions:
+                    conflicts.append(
+                        f"dimension {new_name!r} would shadow a child-group "
+                        "dimension for a variable using the renamed scale"
+                    )
+                    break
+
+        if new_name in self._variables:
+            conflicts.append(f"variable {new_name!r} already exists")
+        elif new_name in self._h5group:
+            obj = self._h5group[new_name]
+            if isinstance(obj, self._root._h5py.Group):
+                conflicts.append(f"group {new_name!r} already exists")
+            elif not self._root._h5py.h5ds.is_scale(obj.id):
+                conflicts.append(f"variable {new_name!r} already exists")
+
+        return conflicts
+
+    def _variable_for_h5path(self, path):
+        parts = [part for part in path.split("/") if part]
+        group = self._root
+        for name in parts[:-1]:
+            group = group._groups[name]
+        name = parts[-1]
+
+        variable = group._variables._objects.get(name)
+        if variable is None:
+            variable = group._variables._objects.get("_nc4_non_coord_" + name)
+        return variable
+
+    def _iter_groups(self):
+        yield self
+        groups = [self]
+        while groups:
+            group = groups.pop()
+            for name in group._groups._objects:
+                child = group._groups[name]
+                yield child
+                groups.append(child)
+
+    def _group_for_h5path(self, path):
+        parts = [part for part in path.split("/") if part]
+        group = self._root
+        for name in parts:
+            group = group._groups[name]
+        return group
 
     def create_enumtype(self, datatype, datatype_name, enum_dict):
         """Create EnumType.
