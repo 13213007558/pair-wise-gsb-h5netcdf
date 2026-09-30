@@ -3222,3 +3222,171 @@ def test_group_dimensions_classic(tmp_local_netcdf):
         with raises(CompatibilityError, match=r"Only one unlimited dimension allowed"):
             group.dimensions["z1"] = None
         assert list(group.dimensions) == ["y", "x", "z"]
+
+
+def test_rename_dimension(tmp_local_netcdf):
+    import netCDF4
+
+    with h5netcdf.File(tmp_local_netcdf, mode="w") as f:
+        f.dimensions["x"] = 3
+        f.dimensions["time"] = 0  # unlimited
+        v = f.create_variable("v", dimensions=("x",), dtype=np.int64)
+        v[:] = [1, 2, 3]
+        t = f.create_variable("time", dimensions=("time",), dtype=np.float64)
+        f.resize_dimension("time", 2)
+        t[:] = [0.5, 1.5]
+        g = f.create_group("g")
+        pv = g.create_variable("pv", dimensions=("x",), dtype=np.int64)
+        pv[:] = [4, 5, 6]
+
+        # hold variable objects and cache their dimension names
+        assert v.dimensions == ("x",)
+        assert t.dimensions == ("time",)
+        assert pv.dimensions == ("x",)
+        dimid_x = f.dimensions["x"]._dimid
+        dimid_time = f.dimensions["time"]._dimid
+
+        # a same-named coordinate variable requires an explicit opt-in
+        with raises(ValueError, match="rename_variable=True"):
+            f.rename_dimension("time", "time2")
+
+        f.rename_dimension("x", "x2")
+        f.rename_dimension("time", "time2", rename_variable=True)
+
+        # dimension bookkeeping, ids and unlimited property are preserved
+        assert list(f.dimensions) == ["x2", "time2"]
+        assert f.dimensions["x2"]._dimid == dimid_x
+        assert f.dimensions["time2"]._dimid == dimid_time
+        assert f.dimensions["time2"].isunlimited()
+        assert len(f.dimensions["x2"]) == 3
+        # already held variable objects see the renamed dimensions
+        assert v.dimensions == ("x2",)
+        assert pv.dimensions == ("x2",)
+        assert t.dimensions == ("time2",)
+        # the coordinate variable has been renamed as well
+        assert "time2" in f.variables
+        assert "time" not in f.variables
+        assert f.variables["time2"].dimensions == ("time2",)
+        assert t.name == "/time2"
+
+    # verify the persisted file with h5netcdf, not just the python cache
+    with h5netcdf.File(tmp_local_netcdf, mode="r") as f:
+        assert list(f.dimensions) == ["x2", "time2"]
+        assert f.dimensions["x2"]._dimid == dimid_x
+        assert f.dimensions["time2"]._dimid == dimid_time
+        assert f.dimensions["time2"].isunlimited()
+        assert f["v"].dimensions == ("x2",)
+        assert f["g"]["pv"].dimensions == ("x2",)
+        assert f["time2"].dimensions == ("time2",)
+        np.testing.assert_array_equal(f["v"][:], [1, 2, 3])
+        np.testing.assert_array_equal(f["g"]["pv"][:], [4, 5, 6])
+        np.testing.assert_array_equal(f["time2"][:], [0.5, 1.5])
+
+    # verify the persisted file with netCDF4
+    with netCDF4.Dataset(tmp_local_netcdf, mode="r") as ds:
+        assert set(ds.dimensions) == {"x2", "time2"}
+        assert ds.dimensions["time2"].isunlimited()
+        assert len(ds.dimensions["x2"]) == 3
+        assert ds["v"].dimensions == ("x2",)
+        assert ds["g"]["pv"].dimensions == ("x2",)
+        assert ds["time2"].dimensions == ("time2",)
+        np.testing.assert_array_equal(ds["v"][:], [1, 2, 3])
+        np.testing.assert_array_equal(ds["g"]["pv"][:], [4, 5, 6])
+        np.testing.assert_array_equal(ds["time2"][:], [0.5, 1.5])
+
+
+def test_rename_dimension_parent_child_same_name(tmp_local_netcdf):
+    import netCDF4
+
+    # parent and child group both have a local dimension "x", only
+    # variables bound to the renamed dimension scale may be updated
+    with h5netcdf.File(tmp_local_netcdf, mode="w") as f:
+        f.dimensions["x"] = 3
+        v = f.create_variable("v", dimensions=("x",), dtype=np.int64)
+        v[:] = [1, 2, 3]
+        g = f.create_group("g")
+        # bound to the parent group dimension scale
+        pv = g.create_variable("pv", dimensions=("x",), dtype=np.int64)
+        pv[:] = [4, 5, 6]
+        # local dimension "x" shadows the parent group dimension
+        g.dimensions["x"] = 7
+        cv = g.create_variable("cv", dimensions=("x",), dtype=np.int64)
+        cv[:] = np.arange(7)
+
+        assert v.dimensions == ("x",)
+        assert pv.dimensions == ("x",)
+        assert cv.dimensions == ("x",)
+        dimid_x = f.dimensions["x"]._dimid
+        dimid_gx = g.dimensions["x"]._dimid
+
+        f.rename_dimension("x", "x2")
+
+        assert list(f.dimensions) == ["x2"]
+        assert list(g.dimensions) == ["x"]
+        # only variables bound to the renamed scale are updated
+        assert v.dimensions == ("x2",)
+        assert pv.dimensions == ("x2",)
+        assert cv.dimensions == ("x",)
+
+    with h5netcdf.File(tmp_local_netcdf, mode="r") as f:
+        assert list(f.dimensions) == ["x2"]
+        assert f.dimensions["x2"]._dimid == dimid_x
+        assert list(f["g"].dimensions) == ["x"]
+        assert f["g"].dimensions["x"]._dimid == dimid_gx
+        assert f["v"].dimensions == ("x2",)
+        assert f["g"]["pv"].dimensions == ("x2",)
+        assert f["g"]["cv"].dimensions == ("x",)
+        np.testing.assert_array_equal(f["v"][:], [1, 2, 3])
+        np.testing.assert_array_equal(f["g"]["pv"][:], [4, 5, 6])
+        np.testing.assert_array_equal(f["g"]["cv"][:], np.arange(7))
+
+    with netCDF4.Dataset(tmp_local_netcdf, mode="r") as ds:
+        assert set(ds.dimensions) == {"x2"}
+        assert set(ds["g"].dimensions) == {"x"}
+        assert ds["v"].dimensions == ("x2",)
+        assert ds["g"]["pv"].dimensions == ("x2",)
+        assert ds["g"]["cv"].dimensions == ("x",)
+        np.testing.assert_array_equal(ds["v"][:], [1, 2, 3])
+        np.testing.assert_array_equal(ds["g"]["pv"][:], [4, 5, 6])
+        np.testing.assert_array_equal(ds["g"]["cv"][:], np.arange(7))
+
+
+def test_rename_dimension_conflicts(tmp_local_netcdf):
+    with h5netcdf.File(tmp_local_netcdf, mode="w") as f:
+        f.dimensions["x"] = 3
+        f.dimensions["y"] = 4
+        f.create_variable("var", dimensions=("x",), dtype=np.int64)
+        g = f.create_group("sub")
+        g.dimensions["gx"] = 2
+
+        # target name clashes with an existing dimension, variable or subgroup
+        for name in ["y", "var", "sub"]:
+            with raises(ValueError, match="already exists"):
+                f.rename_dimension("x", name)
+        # target name would be shadowed by a local dimension of a subgroup
+        with raises(ValueError, match="shadowed"):
+            f.rename_dimension("x", "gx")
+        # target name would shadow the dimension of a parent group
+        with raises(ValueError, match="shadow"):
+            g.rename_dimension("gx", "x")
+        # source dimension does not exist
+        with raises(ValueError, match="does not exist"):
+            f.rename_dimension("z", "z2")
+        # invalid target names
+        for name in ["", "a/b"]:
+            with raises(ValueError, match="invalid dimension name"):
+                f.rename_dimension("x", name)
+
+        # nothing was modified by the failed renames
+        assert list(f.dimensions) == ["x", "y"]
+        assert list(g.dimensions) == ["gx"]
+        assert f["var"].dimensions == ("x",)
+
+        # renaming to the same name is a no-op
+        f.rename_dimension("x", "x")
+        assert list(f.dimensions) == ["x", "y"]
+
+    # renaming requires a writable file
+    with h5netcdf.File(tmp_local_netcdf, mode="r") as f:
+        with raises(RuntimeError, match="Write to read only"):
+            f.rename_dimension("x", "x2")

@@ -882,6 +882,13 @@ class _LazyObjectLookup(Mapping):
     def add(self, name):
         self._objects[name] = None
 
+    def _rename(self, old_name, new_name):
+        # renaming an object, preserving the order of objects
+        self._objects = OrderedDict(
+            (new_name if key == old_name else key, value)
+            for key, value in self._objects.items()
+        )
+
     def __iter__(self):
         for name in self._objects:
             # fix variable name for variable which clashes with dim name
@@ -1688,6 +1695,127 @@ class Group(Mapping):
         zero) where necessary.
         """
         self._dimensions[dim]._resize(size)
+
+    def _descendant_groups(self):
+        """Recursively yield all subgroups of this group."""
+        for name in self._groups:
+            group = self._groups[name]
+            yield group
+            yield from group._descendant_groups()
+
+    def rename_dimension(self, old_name, new_name, rename_variable=False):
+        """Rename a dimension.
+
+        Renames the dimension's HDF5 dimension scale and updates all
+        variables attached to that scale, including already instantiated
+        :class:`Variable` objects and variables in subgroups which use this
+        group's dimension. Variables attached to a like-named dimension
+        scale of a subgroup are not affected.
+
+        Parameters
+        ----------
+        old_name : str
+            Name of the dimension to rename.
+        new_name : str
+            New name of the dimension.
+        rename_variable : bool, optional
+            Whether a coordinate variable with the same name as the
+            dimension is renamed along with it. Defaults to False, in
+            which case renaming a dimension with a same-named coordinate
+            variable raises an error.
+
+        Raises
+        ------
+        ValueError
+            If the dimension does not exist in this group, if ``new_name``
+            conflicts with an existing dimension, variable or subgroup
+            (including shadowing relations with parent groups or
+            subgroups), or if the dimension has a same-named coordinate
+            variable and ``rename_variable`` is False.
+        """
+        if not self._root._writable:
+            raise RuntimeError("H5NetCDF: Write to read only")
+        if old_name not in self._dimensions._objects:
+            raise ValueError(
+                f"dimension {old_name!r} does not exist in group {self.name!r}"
+            )
+        dim = self._dimensions._objects[old_name]
+        if dim._phony:
+            raise ValueError(f"cannot rename phony dimension {old_name!r}")
+        if not isinstance(new_name, str) or not new_name or "/" in new_name:
+            raise ValueError(f"invalid dimension name {new_name!r}")
+        if new_name == old_name:
+            return
+        has_coord_var = old_name in self._variables._objects
+        if has_coord_var and not rename_variable:
+            raise ValueError(
+                f"dimension {old_name!r} has a coordinate variable of the same "
+                "name, pass rename_variable=True to rename it as well"
+            )
+        if new_name in self._h5group:
+            raise ValueError(
+                f"cannot rename dimension {old_name!r} to {new_name!r}, an "
+                f"object named {new_name!r} already exists in group {self.name!r}"
+            )
+        # check for shadowing conflicts with dimensions of parent groups
+        for parent_dimensions in self._all_dimensions.maps[1:]:
+            if new_name in parent_dimensions:
+                raise ValueError(
+                    f"cannot rename dimension {old_name!r} to {new_name!r}, it "
+                    "would shadow the like-named dimension of a parent group"
+                )
+        # check for shadowing conflicts with local dimensions of subgroups
+        for group in self._descendant_groups():
+            if new_name in group._dimensions._objects:
+                raise ValueError(
+                    f"cannot rename dimension {old_name!r} to {new_name!r}, it "
+                    "would be shadowed by the like-named local dimension of "
+                    f"subgroup {group.name!r}"
+                )
+
+        # rename the HDF5 dimension scale dataset, object references of
+        # attached variables (DIMENSION_LIST/REFERENCE_LIST) stay intact
+        self._h5group.move(old_name, new_name)
+
+        # update the dimension bookkeeping
+        self._dimensions._rename(old_name, new_name)
+
+        # rename a same-named coordinate variable as well
+        if has_coord_var:
+            self._variables._rename(old_name, new_name)
+            variable = self._variables._objects[new_name]
+            if variable is not None:
+                variable._h5path = dim._h5path
+            # update the dimension scale name
+            dim._h5ds.attrs["NAME"] = np.bytes_(new_name)
+
+        # update already instantiated variables which are attached to the
+        # renamed dimension scale, also in subgroups
+        new_h5path = dim._h5path
+        for group in [self, *self._descendant_groups()]:
+            for variable in group._variables._objects.values():
+                if variable is None:
+                    continue
+                dimensions = variable._dimensions
+                if dimensions is None or old_name not in dimensions:
+                    continue
+                h5ds = variable._h5ds
+                if h5ds.name == new_h5path:
+                    # the renamed coordinate variable itself
+                    variable._dimensions = tuple(
+                        new_name if d == old_name else d for d in dimensions
+                    )
+                    continue
+                dimension_list = h5ds.attrs.get("DIMENSION_LIST", None)
+                if dimension_list is None:
+                    continue
+                new_dimensions = list(dimensions)
+                for axis, refs in enumerate(dimension_list):
+                    if axis >= len(new_dimensions):
+                        break
+                    if any(self._root._h5file[ref].name == new_h5path for ref in refs):
+                        new_dimensions[axis] = new_name
+                variable._dimensions = tuple(new_dimensions)
 
     def create_enumtype(self, datatype, datatype_name, enum_dict):
         """Create EnumType.

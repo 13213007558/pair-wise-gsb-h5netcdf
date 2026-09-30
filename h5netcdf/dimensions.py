@@ -55,6 +55,16 @@ class Dimensions(MutableMapping):
         # adding dimensions which are already created in the file
         self._objects[name] = Dimension(self._group, name)
 
+    def _rename(self, old_name, new_name):
+        # renaming a dimension, preserving the order of dimensions
+        dim = self._objects[old_name]
+        self._objects = OrderedDict(
+            (new_name if key == old_name else key, value)
+            for key, value in self._objects.items()
+        )
+        dim._name = new_name
+        dim._h5path = _join_h5paths(dim._parent.name, new_name)
+
     def __delitem__(self, key):
         raise NotImplementedError("cannot yet delete dimensions")
 
